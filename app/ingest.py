@@ -10,8 +10,14 @@ DATA_PATH = "data/raw"
 CLEAN_PATH = "data/clean"
 COLLECTION_NAME = "documents"
 
-EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-VECTOR_SIZE = 384
+EMBEDDING_MODEL = "intfloat/multilingual-e5-large"
+VECTOR_SIZE = 1024
+
+CLASS_LEVEL = "11. Sınıf"
+SUBJECT = "Felsefe"
+
+CHUNK_SIZE = 250
+CHUNK_OVERLAP = 60
 
 model = SentenceTransformer(EMBEDDING_MODEL)
 qdrant = QdrantClient("localhost", port=6333)
@@ -20,35 +26,97 @@ qdrant = QdrantClient("localhost", port=6333)
 def clean_text(text: str) -> str:
     text = text.replace("\xa0", " ")
     text = text.replace("￾", "")
+    text = text.replace("", "ı")
+    text = text.replace("", "ı")
+    text = text.replace("", "ğ")
+
     text = re.sub(r"\[\d+\]", "", text)
-    text = re.sub(r"www\.\S+", "", text)
     text = re.sub(r"0:00\s*/\s*0:00", "", text)
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"www\.\S+", "", text)
     text = re.sub(r"([a-zçğıöşü])([A-ZÇĞİÖŞÜ])", r"\1 \2", text)
-    # Çok kısa/gürültülü satırları azaltmak için temel temizlik
-    noise_words = [
+    text = re.sub(r"\s+", " ", text)
+
+    noise_patterns = [
         "IMAGE FOR PAGE",
         "PARSED TEXT FOR PAGE",
+        "Karekod",
+        "akıllı cihazınıza",
+        "Daha fazla içerik",
+        "Ünite sunumu için",
     ]
 
-    for word in noise_words:
-        text = text.replace(word, "")
+    for noise in noise_patterns:
+        text = text.replace(noise, "")
 
     return text.strip()
+
+
+def detect_unit_title(text: str) -> str:
+    patterns = [
+        r"\d+\.\s*ÜNİTE[:\s]+[^\.]{5,120}?FELSEFESİ",
+        r"MÖ\s*\d+.*?FELSEFESİ",
+        r"MS\s*\d+.*?FELSEFESİ",
+        r"\d+\.\s*ÜNİTE",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+
+    return ""
+
+
+def detect_topic_title(text: str) -> str:
+    patterns = [
+        r"\d+\.\d+\.\s+[A-ZÇĞİÖŞÜ0-9\s\-.,]+",
+        r"(Sofistler ile Sokrates’in Bilgi ve Ahlak Anlayışları)",
+        r"(Platon ve Aristoteles’in Varlık, Bilgi ve Değer Anlayışları)",
+        r"(İlk Neden \(Arkhe\) ve Değişim Problemleri)",
+        r"(Hristiyan Felsefesinin Temel Özellikleri ve Problemleri)",
+        r"(İslam Felsefesinin Temel Özellikleri ve Problemleri)",
+        r"(Evrenin Yaratılışı Problemi)",
+        r"(Kötülük Problemi)",
+        r"(Tümeller Problemi)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+
+    return ""
 
 
 def read_pdf(file_path: str) -> list[dict]:
     reader = PdfReader(file_path)
     pages = []
 
+    current_unit = ""
+    current_topic = ""
+
     for page_number, page in enumerate(reader.pages, start=1):
         raw_text = page.extract_text() or ""
         cleaned = clean_text(raw_text)
 
-        if len(cleaned) > 100:
+        found_unit = detect_unit_title(cleaned)
+        if found_unit:
+            current_unit = found_unit
+
+        found_topic = detect_topic_title(cleaned)
+        if found_topic:
+            current_topic = found_topic
+
+        # Kapak, İstiklal Marşı, Gençliğe Hitabe, içindekiler vb.
+        if page_number < 10:
+            continue
+
+        if len(cleaned) > 150:
             pages.append({
                 "page": page_number,
-                "text": cleaned
+                "text": cleaned,
+                "unit": current_unit,
+                "topic": current_topic
             })
 
     return pages
@@ -63,12 +131,16 @@ def save_clean_text(file_name: str, pages: list[dict]):
     with open(clean_file_path, "w", encoding="utf-8") as f:
         for page in pages:
             f.write(f"\n\n[PAGE {page['page']}]\n")
+            if page.get("unit"):
+                f.write(f"[UNIT] {page['unit']}\n")
+            if page.get("topic"):
+                f.write(f"[TOPIC] {page['topic']}\n")
             f.write(page["text"])
 
     print(f"Clean text saved: {clean_file_path}")
 
 
-def chunk_pages(pages: list[dict], chunk_size=260, overlap=60) -> list[dict]:
+def chunk_pages(pages: list[dict], chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP) -> list[dict]:
     chunks = []
 
     for page in pages:
@@ -80,10 +152,22 @@ def chunk_pages(pages: list[dict], chunk_size=260, overlap=60) -> list[dict]:
             end = start + chunk_size
             chunk_text = " ".join(words[start:end]).strip()
 
-            if len(chunk_text) > 200:
+            if len(chunk_text) > 250:
+                enriched_text = (
+                    f"Ders: {SUBJECT}\n"
+                    f"Sınıf: {CLASS_LEVEL}\n"
+                    f"Ünite: {page.get('unit', '')}\n"
+                    f"Konu: {page.get('topic', '')}\n"
+                    f"Sayfa: {page['page']}\n"
+                    f"Metin: {chunk_text}"
+                )
+
                 chunks.append({
                     "text": chunk_text,
+                    "enriched_text": enriched_text,
                     "page": page["page"],
+                    "unit": page.get("unit", ""),
+                    "topic": page.get("topic", ""),
                     "chunk_index": chunk_index
                 })
 
@@ -122,8 +206,20 @@ def ingest():
         chunks = chunk_pages(pages)
         print(f"Chunks created: {len(chunks)}")
 
-        texts = [chunk["text"] for chunk in chunks]
-        embeddings = model.encode(texts, show_progress_bar=True)
+        if not chunks:
+            print(f"No chunks found for {file_name}")
+            continue
+
+        embedding_texts = [
+            f"passage: {chunk['enriched_text']}"
+            for chunk in chunks
+        ]
+
+        embeddings = model.encode(
+            embedding_texts,
+            show_progress_bar=True,
+            normalize_embeddings=True
+        )
 
         points = []
 
@@ -134,7 +230,12 @@ def ingest():
                     vector=vector.tolist(),
                     payload={
                         "text": chunk["text"],
+                        "enriched_text": chunk["enriched_text"],
                         "source": file_name,
+                        "class_level": CLASS_LEVEL,
+                        "subject": SUBJECT,
+                        "unit": chunk["unit"],
+                        "topic": chunk["topic"],
                         "page": chunk["page"],
                         "chunk_index": chunk["chunk_index"],
                         "embedding_model": EMBEDDING_MODEL,
